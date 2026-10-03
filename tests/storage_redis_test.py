@@ -6,6 +6,8 @@ from unittest.async_case import IsolatedAsyncioTestCase
 
 import fakeredis.aioredis
 
+from utils import AnyString
+
 from agentscope.app.storage import (
     RedisStorage,
     AgentRecord,
@@ -14,14 +16,24 @@ from agentscope.app.storage import (
     ChatModelConfig,
     ScheduleRecord,
     ScheduleData,
-    SessionSource,
+    ChannelOrigin,
+    ScheduleOrigin,
     TeamData,
+    TeamMember,
     TeamRecord,
+    SOPAgentRef,
+    SOPData,
+    SOPRecord,
+    SOPRunRecord,
+    SOPStepDataV1,
 )
+from agentscope.app.storage import MCPRecord, SkillRecord
 from agentscope.credential import OllamaCredential
+from agentscope.mcp import HttpMCPConfig, MCPClient
 from agentscope.app.storage import AgentData
 from agentscope.agent import ContextConfig, ReActConfig
 from agentscope.message import UserMsg, AssistantMsg, TextBlock
+from agentscope.sop import SOPPhase, SOPRunState, SOPStepRunState
 from agentscope.state import AgentState
 
 
@@ -653,8 +665,7 @@ class TestScheduleSession(IsolatedAsyncioTestCase):
             self.user_id,
             self.agent_id,
             make_session_config(),
-            source=SessionSource.SCHEDULE,
-            source_schedule_id=schedule.id,
+            origin=ScheduleOrigin(schedule_id=schedule.id),
         )
 
         results = await self.storage.list_sessions_by_schedule(
@@ -663,7 +674,10 @@ class TestScheduleSession(IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].id, session.id)
-        self.assertEqual(results[0].source_schedule_id, schedule.id)
+        self.assertEqual(
+            results[0].origin,
+            ScheduleOrigin(schedule_id=schedule.id),
+        )
 
     async def test_list_sessions_by_schedule_empty(self) -> None:
         """Returns empty list when no sessions exist for a schedule."""
@@ -683,8 +697,7 @@ class TestScheduleSession(IsolatedAsyncioTestCase):
             self.user_id,
             self.agent_id,
             make_session_config(),
-            source=SessionSource.SCHEDULE,
-            source_schedule_id=schedule.id,
+            origin=ScheduleOrigin(schedule_id=schedule.id),
         )
 
         agent_sessions = await self.storage.list_sessions(
@@ -703,15 +716,13 @@ class TestScheduleSession(IsolatedAsyncioTestCase):
             self.user_id,
             self.agent_id,
             make_session_config(),
-            source=SessionSource.SCHEDULE,
-            source_schedule_id=schedule.id,
+            origin=ScheduleOrigin(schedule_id=schedule.id),
         )
         await self.storage.upsert_session(
             self.user_id,
             self.agent_id,
             make_session_config(),
-            source=SessionSource.SCHEDULE,
-            source_schedule_id=schedule.id,
+            origin=ScheduleOrigin(schedule_id=schedule.id),
         )
 
         await self.storage.delete_schedule(self.user_id, schedule.id)
@@ -737,8 +748,7 @@ class TestScheduleSession(IsolatedAsyncioTestCase):
             self.user_id,
             self.agent_id,
             make_session_config(),
-            source=SessionSource.SCHEDULE,
-            source_schedule_id=schedule.id,
+            origin=ScheduleOrigin(schedule_id=schedule.id),
         )
 
         await self.storage.delete_session(
@@ -1132,6 +1142,55 @@ class TestTeamCascade(IsolatedAsyncioTestCase):
         self.assertIsNotNone(leader)
         self.assertIsNone(leader.team_id)
 
+    async def test_delete_team_removes_cross_owner_borrowed_session(
+        self,
+    ) -> None:
+        """An invited definition owner differs from its session owner."""
+        definition_owner = "user-2"
+        invited = make_agent_record(definition_owner)
+        await self.storage.upsert_agent(definition_owner, invited)
+        owner_session = await self.storage.upsert_session(
+            definition_owner,
+            invited.id,
+            make_session_config("owner-private-workspace"),
+        )
+        borrowed = await self.storage.upsert_session(
+            self.user_id,
+            invited.id,
+            make_session_config("viewer-borrowed-workspace"),
+        )
+        self.team.data.members = [
+            TeamMember(
+                owner_id=definition_owner,
+                agent_id=invited.id,
+                session_id=borrowed.id,
+                role="invited",
+            ),
+        ]
+        self.team.data.member_ids = [invited.id]
+        await self.storage.upsert_team(self.user_id, self.team)
+
+        self.assertTrue(
+            await self.storage.delete_team(self.user_id, self.team.id),
+        )
+        self.assertIsNone(
+            await self.storage.get_session(
+                self.user_id,
+                invited.id,
+                borrowed.id,
+            ),
+        )
+        self.assertIsNotNone(
+            await self.storage.get_session(
+                definition_owner,
+                invited.id,
+                owner_session.id,
+            ),
+        )
+        self.assertIsNotNone(
+            await self.storage.get_agent(definition_owner, invited.id),
+        )
+
     async def test_delete_leader_session_dissolves_team(self) -> None:
         """Deleting a leader session auto-dissolves its team."""
         await self.storage.delete_session(
@@ -1211,3 +1270,674 @@ class TestTeamCascade(IsolatedAsyncioTestCase):
         """delete_team on a missing team returns False without crashing."""
         result = await self.storage.delete_team(self.user_id, "no-such-id")
         self.assertFalse(result)
+
+
+def make_mcp_record(
+    user_id: str,
+    name: str = "deepwiki",
+    **kwargs: object,
+) -> MCPRecord:
+    """Create a test MCPRecord wrapping a stateless HTTP MCP."""
+    return MCPRecord(
+        user_id=user_id,
+        client=MCPClient(
+            name=name,
+            is_stateful=False,
+            mcp_config=HttpMCPConfig(url="https://mcp.deepwiki.com/mcp"),
+        ),
+        **kwargs,
+    )
+
+
+class TestMCP(IsolatedAsyncioTestCase):
+    """Tests for installed-MCP CRUD and the per-user name uniqueness."""
+
+    async def asyncSetUp(self) -> None:
+        """Set up test fixtures."""
+        self.storage = make_storage()
+        self.user_id = "user-mcp"
+
+    async def test_upsert_and_get_roundtrip(self) -> None:
+        """A written record comes back with its provenance intact."""
+        record = make_mcp_record(
+            self.user_id,
+            hub_id="static",
+            card_id="deepwiki",
+            version="1.0.0",
+        )
+        mcp_id = await self.storage.upsert_mcp(self.user_id, record)
+
+        fetched = await self.storage.get_mcp(self.user_id, mcp_id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.client.name, "deepwiki")
+        self.assertEqual(fetched.client.mcp_config.type, "http_mcp")
+        self.assertEqual(fetched.hub_id, "static")
+        self.assertEqual(fetched.card_id, "deepwiki")
+        self.assertEqual(fetched.version, "1.0.0")
+        self.assertTrue(fetched.enabled)
+
+    async def test_manually_added_mcp_has_no_provenance(self) -> None:
+        """An MCP added by hand still gets a record, just without a hub."""
+        record = make_mcp_record(self.user_id, name="hand-rolled")
+        await self.storage.upsert_mcp(self.user_id, record)
+
+        fetched = await self.storage.get_mcp_by_name(
+            self.user_id,
+            "hand-rolled",
+        )
+        self.assertIsNotNone(fetched)
+        self.assertIsNone(fetched.hub_id)
+        self.assertIsNone(fetched.card_id)
+
+    async def test_duplicate_name_rejected(self) -> None:
+        """Two records may not share a name — the workspace joins on it."""
+        await self.storage.upsert_mcp(
+            self.user_id,
+            make_mcp_record(self.user_id),
+        )
+        with self.assertRaises(ValueError):
+            await self.storage.upsert_mcp(
+                self.user_id,
+                make_mcp_record(self.user_id),
+            )
+
+    async def test_same_name_across_users_allowed(self) -> None:
+        """Uniqueness is per user, not global."""
+        await self.storage.upsert_mcp(
+            self.user_id,
+            make_mcp_record(self.user_id),
+        )
+        other = await self.storage.upsert_mcp(
+            "other-user",
+            make_mcp_record("other-user"),
+        )
+        self.assertIsNotNone(await self.storage.get_mcp("other-user", other))
+
+    async def test_update_in_place_keeps_name_claim(self) -> None:
+        """Re-upserting the same record is an update, not a name clash."""
+        record = make_mcp_record(self.user_id)
+        mcp_id = await self.storage.upsert_mcp(self.user_id, record)
+
+        record.enabled = False
+        await self.storage.upsert_mcp(self.user_id, record)
+
+        fetched = await self.storage.get_mcp(self.user_id, mcp_id)
+        self.assertFalse(fetched.enabled)
+        self.assertEqual(len(await self.storage.list_mcps(self.user_id)), 1)
+
+    async def test_rename_releases_the_old_name(self) -> None:
+        """After a rename the old name is free and no longer resolves."""
+        record = make_mcp_record(self.user_id)
+        await self.storage.upsert_mcp(self.user_id, record)
+
+        record.client.name = "deepwiki-2"
+        await self.storage.upsert_mcp(self.user_id, record)
+
+        self.assertIsNone(
+            await self.storage.get_mcp_by_name(self.user_id, "deepwiki"),
+        )
+        self.assertIsNotNone(
+            await self.storage.get_mcp_by_name(self.user_id, "deepwiki-2"),
+        )
+        # The freed name can now be claimed by a different record
+        await self.storage.upsert_mcp(
+            self.user_id,
+            make_mcp_record(self.user_id),
+        )
+        self.assertEqual(len(await self.storage.list_mcps(self.user_id)), 2)
+
+    async def test_delete_frees_the_name(self) -> None:
+        """Deleting a record releases its name for reuse."""
+        record = make_mcp_record(self.user_id)
+        mcp_id = await self.storage.upsert_mcp(self.user_id, record)
+
+        self.assertTrue(await self.storage.delete_mcp(self.user_id, mcp_id))
+        self.assertIsNone(
+            await self.storage.get_mcp_by_name(self.user_id, "deepwiki"),
+        )
+        self.assertEqual(await self.storage.list_mcps(self.user_id), [])
+
+        await self.storage.upsert_mcp(
+            self.user_id,
+            make_mcp_record(self.user_id),
+        )
+
+    async def test_delete_missing_returns_false(self) -> None:
+        """delete_mcp on a missing record returns False without crashing."""
+        self.assertFalse(
+            await self.storage.delete_mcp(self.user_id, "no-such-id"),
+        )
+
+    async def test_get_by_unknown_name_returns_none(self) -> None:
+        """An unclaimed name resolves to nothing."""
+        self.assertIsNone(
+            await self.storage.get_mcp_by_name(self.user_id, "nope"),
+        )
+
+
+def make_skill_record(
+    user_id: str,
+    name: str = "gifgrep",
+    **kwargs: object,
+) -> SkillRecord:
+    """Create a test SkillRecord."""
+    return SkillRecord(user_id=user_id, name=name, **kwargs)
+
+
+class TestSkill(IsolatedAsyncioTestCase):
+    """Tests for installed-skill CRUD and per-user name uniqueness."""
+
+    async def asyncSetUp(self) -> None:
+        """Set up test fixtures."""
+        self.storage = make_storage()
+        self.user_id = "user-skill"
+
+    async def test_upsert_and_get_roundtrip(self) -> None:
+        """A written record comes back with its provenance intact."""
+        record = make_skill_record(
+            self.user_id,
+            hub_id="clawhub",
+            card_id="gifgrep",
+            version="1.0.1",
+            markdown="# gifgrep",
+        )
+        skill_id = await self.storage.upsert_skill(self.user_id, record)
+
+        fetched = await self.storage.get_skill(
+            self.user_id,
+            skill_id,
+        )
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.name, "gifgrep")
+        self.assertEqual(fetched.hub_id, "clawhub")
+        self.assertEqual(fetched.markdown, "# gifgrep")
+        self.assertTrue(fetched.enabled)
+
+    async def test_duplicate_name_rejected(self) -> None:
+        """Two records may not share a name."""
+        await self.storage.upsert_skill(
+            self.user_id,
+            make_skill_record(self.user_id),
+        )
+        with self.assertRaises(ValueError):
+            await self.storage.upsert_skill(
+                self.user_id,
+                make_skill_record(self.user_id),
+            )
+
+    async def test_same_name_across_users_allowed(self) -> None:
+        """Uniqueness is per user, not global."""
+        await self.storage.upsert_skill(
+            self.user_id,
+            make_skill_record(self.user_id),
+        )
+        other = await self.storage.upsert_skill(
+            "other-user",
+            make_skill_record("other-user"),
+        )
+        self.assertIsNotNone(
+            await self.storage.get_skill("other-user", other),
+        )
+
+    async def test_update_in_place_keeps_name_claim(self) -> None:
+        """Re-upserting the same record is an update, not a name clash."""
+        record = make_skill_record(self.user_id)
+        skill_id = await self.storage.upsert_skill(self.user_id, record)
+
+        record.enabled = False
+        await self.storage.upsert_skill(self.user_id, record)
+
+        fetched = await self.storage.get_skill(
+            self.user_id,
+            skill_id,
+        )
+        self.assertFalse(fetched.enabled)
+        self.assertEqual(
+            len(await self.storage.list_skills(self.user_id)),
+            1,
+        )
+
+    async def test_rename_releases_the_old_name(self) -> None:
+        """After a rename the old name is free and no longer resolves."""
+        record = make_skill_record(self.user_id)
+        await self.storage.upsert_skill(self.user_id, record)
+
+        record.name = "gifgrep-2"
+        await self.storage.upsert_skill(self.user_id, record)
+
+        self.assertIsNone(
+            await self.storage.get_skill_by_name(
+                self.user_id,
+                "gifgrep",
+            ),
+        )
+        self.assertIsNotNone(
+            await self.storage.get_skill_by_name(
+                self.user_id,
+                "gifgrep-2",
+            ),
+        )
+        await self.storage.upsert_skill(
+            self.user_id,
+            make_skill_record(self.user_id),
+        )
+        self.assertEqual(
+            len(await self.storage.list_skills(self.user_id)),
+            2,
+        )
+
+    async def test_delete_frees_the_name(self) -> None:
+        """Deleting a record releases its name for reuse."""
+        record = make_skill_record(self.user_id)
+        skill_id = await self.storage.upsert_skill(self.user_id, record)
+
+        self.assertTrue(
+            await self.storage.delete_skill(self.user_id, skill_id),
+        )
+        self.assertIsNone(
+            await self.storage.get_skill_by_name(
+                self.user_id,
+                "gifgrep",
+            ),
+        )
+        self.assertEqual(
+            await self.storage.list_skills(self.user_id),
+            [],
+        )
+
+        await self.storage.upsert_skill(
+            self.user_id,
+            make_skill_record(self.user_id),
+        )
+
+    async def test_delete_missing_returns_false(self) -> None:
+        """Deleting a missing record returns False without crashing."""
+        self.assertFalse(
+            await self.storage.delete_skill(
+                self.user_id,
+                "no-such-id",
+            ),
+        )
+
+    async def test_mcp_and_skill_libraries_are_independent(self) -> None:
+        """The two name indexes do not collide."""
+        await self.storage.upsert_mcp(
+            self.user_id,
+            make_mcp_record(self.user_id, name="shared"),
+        )
+        await self.storage.upsert_skill(
+            self.user_id,
+            make_skill_record(self.user_id, name="shared"),
+        )
+
+        self.assertEqual(len(await self.storage.list_mcps(self.user_id)), 1)
+        self.assertEqual(
+            len(await self.storage.list_skills(self.user_id)),
+            1,
+        )
+
+
+class TestChannelSessionIndex(IsolatedAsyncioTestCase):
+    """The channel index, which the tagged union now drives.
+
+    It used to be written from a nullable ``source_channel_id``; it is
+    now written from a ``ChannelOrigin``, and the schedule path's
+    coverage says nothing about it.
+    """
+
+    async def asyncSetUp(self) -> None:
+        """Set up test fixtures."""
+        self.storage = make_storage()
+        self.user_id = "user-1"
+        self.agent_id = "agent-1"
+
+    async def test_a_channel_session_is_indexed_and_unindexed(self) -> None:
+        """It is found by its channel, and gone once the session is."""
+        session = await self.storage.upsert_session(
+            self.user_id,
+            self.agent_id,
+            make_session_config(),
+            origin=ChannelOrigin(
+                channel_id="chan-1",
+                chat_id="chat-1",
+                chat_name="产品群",
+            ),
+        )
+
+        found = await self.storage.list_sessions_by_channel(
+            self.user_id,
+            "chan-1",
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].id, session.id)
+        self.assertEqual(
+            found[0].origin,
+            ChannelOrigin(
+                channel_id="chan-1",
+                chat_id="chat-1",
+                chat_name="产品群",
+            ),
+        )
+
+        await self.storage.delete_session(
+            self.user_id,
+            self.agent_id,
+            session.id,
+        )
+
+        self.assertEqual(
+            await self.storage.list_sessions_by_channel(
+                self.user_id,
+                "chan-1",
+            ),
+            [],
+        )
+
+    async def test_a_session_from_elsewhere_is_not_indexed(self) -> None:
+        """Only a ChannelOrigin goes into the channel index."""
+        await self.storage.upsert_session(
+            self.user_id,
+            self.agent_id,
+            make_session_config(),
+        )
+        self.assertEqual(
+            await self.storage.list_sessions_by_channel(
+                self.user_id,
+                "chan-1",
+            ),
+            [],
+        )
+
+
+# A procedure needs at least one milestone, so the fixtures that only
+# care about the record around it still carry one.
+_A_STEP = SOPStepDataV1(
+    subject="model",
+    description="make the hull",
+    executor=SOPAgentRef(agent_id="a-1", session_key="modeller"),
+)
+
+
+def make_sop_record(user_id: str) -> SOPRecord:
+    """A one-step procedure."""
+    return SOPRecord(
+        user_id=user_id,
+        data=SOPData(
+            name="ship",
+            description="build one",
+            steps=[
+                SOPStepDataV1(
+                    subject="model",
+                    description="make the hull",
+                    executor=SOPAgentRef(
+                        agent_id="agent-1",
+                        session_key="modeller",
+                    ),
+                ),
+            ],
+        ),
+    )
+
+
+class TestSOP(IsolatedAsyncioTestCase):
+    """Tests for SOP and SOP run CRUD."""
+
+    async def asyncSetUp(self) -> None:
+        """Set up test fixtures."""
+        self.storage = make_storage()
+        self.user_id = "user-1"
+
+    async def test_round_trip(self) -> None:
+        """A stored procedure comes back whole."""
+        record = make_sop_record(self.user_id)
+        await self.storage.upsert_sop(self.user_id, record)
+
+        fetched = await self.storage.get_sop(self.user_id, record.id)
+
+        self.maxDiff = None
+        self.assertDictEqual(
+            fetched.model_dump(mode="json"),
+            {
+                "id": AnyString(),
+                "created_at": AnyString(),
+                "updated_at": AnyString(),
+                "user_id": "user-1",
+                "data": {
+                    "name": "ship",
+                    "description": "build one",
+                    "steps": [
+                        {
+                            "version": "v1",
+                            "subject": "model",
+                            "description": "make the hull",
+                            "executor": {
+                                "agent_id": "agent-1",
+                                "session_key": "modeller",
+                            },
+                            "verifier": None,
+                            "max_attempts": 3,
+                        },
+                    ],
+                    "workspace_grain": "run",
+                    "session_settings": {},
+                },
+            },
+        )
+        self.assertEqual(
+            [_.id for _ in await self.storage.list_sops(self.user_id)],
+            [record.id],
+        )
+
+    async def test_user_isolation(self) -> None:
+        """One user's procedures are invisible to another."""
+        record = make_sop_record("user-A")
+        await self.storage.upsert_sop("user-A", record)
+
+        self.assertEqual(await self.storage.list_sops("user-B"), [])
+        self.assertIsNone(await self.storage.get_sop("user-B", record.id))
+
+    async def test_delete(self) -> None:
+        """Deleting twice reports the second as a miss."""
+        record = make_sop_record(self.user_id)
+        await self.storage.upsert_sop(self.user_id, record)
+
+        self.assertTrue(await self.storage.delete_sop(self.user_id, record.id))
+        self.assertFalse(
+            await self.storage.delete_sop(self.user_id, record.id),
+        )
+        self.assertEqual(await self.storage.list_sops(self.user_id), [])
+
+    async def test_runs_are_listed_by_procedure_and_phase(self) -> None:
+        """The per-procedure index narrows the read; phase filters after."""
+        waiting = SOPRunRecord(
+            user_id=self.user_id,
+            sop_id="sop-1",
+            definition=SOPData(name="a", steps=[_A_STEP]),
+            state=SOPRunState(
+                steps=[SOPStepRunState(phase=SOPPhase.AWAITING)],
+            ),
+        )
+        done = SOPRunRecord(
+            user_id=self.user_id,
+            sop_id="sop-1",
+            definition=SOPData(name="a", steps=[_A_STEP]),
+            state=SOPRunState(
+                steps=[SOPStepRunState(phase=SOPPhase.COMPLETED)],
+            ),
+        )
+        other = SOPRunRecord(
+            user_id=self.user_id,
+            sop_id="sop-2",
+            definition=SOPData(name="b", steps=[_A_STEP]),
+            state=SOPRunState(
+                steps=[SOPStepRunState(phase=SOPPhase.AWAITING)],
+            ),
+        )
+        for record in (waiting, done, other):
+            await self.storage.upsert_sop_run(self.user_id, record)
+
+        self.assertEqual(
+            {
+                _.id
+                for _ in await self.storage.list_sop_runs(
+                    self.user_id,
+                    sop_id="sop-1",
+                )
+            },
+            {waiting.id, done.id},
+        )
+        self.assertEqual(
+            {
+                _.id
+                for _ in await self.storage.list_sop_runs(
+                    self.user_id,
+                    phase=SOPPhase.AWAITING,
+                )
+            },
+            {waiting.id, other.id},
+        )
+
+    async def test_update_run_writes_state_and_sessions(self) -> None:
+        """The hot path rewrites what moves and keeps the snapshot."""
+        run = SOPRunRecord(
+            user_id=self.user_id,
+            sop_id="sop-1",
+            definition=SOPData(name="ship", steps=[_A_STEP]),
+            state=SOPRunState(steps=[SOPStepRunState()]),
+        )
+        await self.storage.upsert_sop_run(self.user_id, run)
+
+        await self.storage.update_sop_run(
+            self.user_id,
+            run.id,
+            SOPRunState(steps=[SOPStepRunState(phase=SOPPhase.AWAITING)]),
+            sessions={"modeller": "session-1"},
+        )
+
+        updated = await self.storage.get_sop_run(self.user_id, run.id)
+
+        self.maxDiff = None
+        self.assertDictEqual(
+            updated.model_dump(mode="json"),
+            {
+                "id": run.id,
+                "created_at": AnyString(),
+                "updated_at": AnyString(),
+                "user_id": "user-1",
+                "sop_id": "sop-1",
+                "definition": {
+                    "name": "ship",
+                    "description": "",
+                    "steps": [
+                        {
+                            "version": "v1",
+                            "subject": "model",
+                            "description": "make the hull",
+                            "executor": {
+                                "agent_id": "a-1",
+                                "session_key": "modeller",
+                            },
+                            "verifier": None,
+                            "max_attempts": 3,
+                        },
+                    ],
+                    "workspace_grain": "run",
+                    "session_settings": {},
+                },
+                "sessions": {"modeller": "session-1"},
+                "state": {
+                    "id": AnyString(),
+                    "inputs": [],
+                    "steps": [
+                        {
+                            "phase": "awaiting",
+                            "given": [],
+                            "submission": None,
+                            "verifications": [],
+                        },
+                    ],
+                    "created_at": AnyString(),
+                    "phase": "awaiting",
+                },
+            },
+        )
+
+        with self.assertRaises(KeyError):
+            await self.storage.update_sop_run(
+                self.user_id,
+                "no-such-id",
+                SOPRunState(),
+            )
+
+    async def test_deleting_a_sop_takes_its_runs_with_it(self) -> None:
+        """A run is only readable through the definition it snapshotted."""
+        sop = make_sop_record(self.user_id)
+        await self.storage.upsert_sop(self.user_id, sop)
+        run = SOPRunRecord(
+            user_id=self.user_id,
+            sop_id=sop.id,
+            definition=sop.data,
+        )
+        await self.storage.upsert_sop_run(self.user_id, run)
+
+        await self.storage.delete_sop(self.user_id, sop.id)
+
+        self.assertIsNone(await self.storage.get_sop_run(self.user_id, run.id))
+        self.assertEqual(await self.storage.list_sop_runs(self.user_id), [])
+
+    async def test_deleting_a_run_takes_its_sessions(self) -> None:
+        """The run minted them, so none is left behind to be woken."""
+        await self.storage.upsert_agent(
+            self.user_id,
+            make_agent_record(self.user_id),
+        )
+        agents = await self.storage.list_agents(self.user_id)
+        session = await self.storage.upsert_session(
+            user_id=self.user_id,
+            agent_id=agents[0].id,
+            config=SessionConfig(workspace_id="ws-1"),
+        )
+        run = SOPRunRecord(
+            user_id=self.user_id,
+            sop_id="sop-1",
+            definition=SOPData(name="ship", steps=[_A_STEP]),
+            sessions={"modeller": session.id},
+        )
+        await self.storage.upsert_sop_run(self.user_id, run)
+
+        self.assertTrue(
+            await self.storage.delete_sop_run(self.user_id, run.id),
+        )
+
+        self.assertIsNone(
+            await self.storage.get_session(
+                self.user_id,
+                agents[0].id,
+                session.id,
+            ),
+        )
+
+    async def test_a_step_state_subclass_survives_redis(self) -> None:
+        """What a step kept beyond the base record is stored, not trimmed."""
+        run = SOPRunRecord(
+            user_id=self.user_id,
+            sop_id="sop-1",
+            definition=SOPData(name="ship", steps=[_A_STEP]),
+            state=SOPRunState(
+                steps=[SOPStepRunState(phase=SOPPhase.AWAITING, call_id="c1")],
+            ),
+        )
+        await self.storage.upsert_sop_run(self.user_id, run)
+
+        fetched = await self.storage.get_sop_run(self.user_id, run.id)
+
+        self.assertDictEqual(
+            fetched.state.steps[0].model_dump(mode="json"),
+            {
+                "phase": "awaiting",
+                "given": [],
+                "submission": None,
+                "verifications": [],
+                "call_id": "c1",
+            },
+        )
